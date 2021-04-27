@@ -14,15 +14,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"flag"
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"time"
 
 	"google.golang.org/grpc"
@@ -46,6 +51,7 @@ var (
 	flTLSServerName string
 	flVerbose       bool
 	flGZIP          bool
+	flWeb           bool
 )
 
 const (
@@ -77,6 +83,7 @@ func init() {
 	flagSet.StringVar(&flTLSServerName, "tls-server-name", "", "(with -tls) override the hostname used to verify the server certificate")
 	flagSet.BoolVar(&flVerbose, "v", false, "verbose logs")
 	flagSet.BoolVar(&flGZIP, "gzip", false, "use GZIPCompressor for requests and GZIPDecompressor for response (default: false)")
+	flagSet.BoolVar(&flWeb, "web", false, "send a http1.1 grpc-web message instead of a http2 grpc message (default: false)")
 
 	err := flagSet.Parse(os.Args[1:])
 	if err != nil {
@@ -183,6 +190,110 @@ func main() {
 			return
 		}
 	}()
+	resp, connDuration, rpcDuration := doCall(&retcode, ctx)
+
+	if resp == nil {
+		return
+	}
+
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		log.Printf("service unhealthy (responded with %q)", resp.GetStatus().String())
+		retcode = StatusUnhealthy
+		return
+	}
+	if flVerbose {
+		log.Printf("time elapsed: connect=%v rpc=%v", connDuration, rpcDuration)
+	}
+	log.Printf("status: %v", resp.GetStatus().String())
+	return
+
+}
+
+func doCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse,time.Duration, time.Duration) {
+	if flWeb {
+		return doWebCall(retcode, ctx)
+	}
+	return doGrpcCall(retcode, ctx)
+}
+
+func doWebCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse, time.Duration, time.Duration) {
+	var url = "http://"
+	if flTLS {
+		url = "https://"
+	}
+
+	url+= flAddr+"/grpc.health.v1.Health/Check"
+
+	var contentType = "application/grpc-web-text+proto"
+
+	requestMsg := &healthpb.HealthCheckRequest{
+		Service: flService,
+	}
+
+	requestMsgBytes, err := proto.Marshal(requestMsg)
+	if err != nil {
+		log.Printf("failed building grpc web request message. error=%v", err)
+		*retcode = StatusInvalidArguments
+		return nil, 0, 0
+	}
+
+	headerBytes := append([]byte{0,0,0,0}, byte(len(requestMsgBytes)))
+	requestBytes := append(headerBytes, requestMsgBytes...)
+
+	requestString := base64.StdEncoding.EncodeToString(requestBytes)
+
+	client := http.Client{
+		Timeout: flConnTimeout,
+	}
+	connStart := time.Now()
+	res, err := client.Post(url, contentType, bytes.NewBuffer([]byte(requestString)))
+	if err != nil {
+		log.Printf("grpc web request failed. error=%v", err)
+		*retcode = StatusConnectionFailure
+		return nil, 0, 0
+	}
+	connDuration := time.Since(connStart)
+
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		log.Printf("got invalid grpc web result. status=%v", res.StatusCode)
+		*retcode = StatusRPCFailure
+		return nil, 0, 0
+	}
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		log.Printf("got invalid grpc web result. error=%v", err)
+		*retcode = StatusRPCFailure
+		return nil, 0, 0
+	}
+
+	var bodyString = string(body)
+	m1 := regexp.MustCompile(`(=+).+`)
+	var result = m1.ReplaceAllString(bodyString, "$1")
+
+	dedodedBytes, err := base64.StdEncoding.DecodeString(result)
+	if err != nil {
+		log.Printf("got invalid grpc web result. error=%v", err)
+		*retcode = StatusRPCFailure
+		return nil, 0, 0
+	}
+	resultBytes := dedodedBytes[5:]
+
+	protomsg := &healthpb.HealthCheckResponse{}
+
+	err = proto.Unmarshal(resultBytes, protomsg)
+	if err != nil {
+		log.Printf("got invalid grpc web result, failed while parsing. error=%v", err)
+		*retcode = StatusRPCFailure
+		return nil, 0, 0
+	}
+
+	return protomsg, connDuration, 0
+}
+
+func doGrpcCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse, time.Duration, time.Duration) {
 
 	opts := []grpc.DialOption{
 		grpc.WithUserAgent(flUserAgent),
@@ -192,8 +303,8 @@ func main() {
 		creds, err := buildCredentials(flTLSNoVerify, flTLSCACert, flTLSClientCert, flTLSClientKey, flTLSServerName)
 		if err != nil {
 			log.Printf("failed to initialize tls credentials. error=%v", err)
-			retcode = StatusInvalidArguments
-			return
+			*retcode = StatusInvalidArguments
+			return nil, 0, 0
 		}
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	} else {
@@ -220,8 +331,8 @@ func main() {
 		} else {
 			log.Printf("error: failed to connect service at %q: %+v", flAddr, err)
 		}
-		retcode = StatusConnectionFailure
-		return
+		*retcode = StatusConnectionFailure
+		return nil, 0, 0
 	}
 	connDuration := time.Since(connStart)
 	defer conn.Close()
@@ -243,18 +354,10 @@ func main() {
 		} else {
 			log.Printf("error: health rpc failed: %+v", err)
 		}
-		retcode = StatusRPCFailure
-		return
+		*retcode = StatusRPCFailure
+		return nil, 0, 0
 	}
 	rpcDuration := time.Since(rpcStart)
 
-	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
-		log.Printf("service unhealthy (responded with %q)", resp.GetStatus().String())
-		retcode = StatusUnhealthy
-		return
-	}
-	if flVerbose {
-		log.Printf("time elapsed: connect=%v rpc=%v", connDuration, rpcDuration)
-	}
-	log.Printf("status: %v", resp.GetStatus().String())
+	return resp, connDuration, rpcDuration
 }
