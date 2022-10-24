@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"github.com/golang/protobuf/proto"
@@ -209,7 +210,7 @@ func main() {
 
 }
 
-func doCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse,time.Duration, time.Duration) {
+func doCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse, time.Duration, time.Duration) {
 	if flWeb {
 		return doWebCall(retcode, ctx)
 	}
@@ -222,7 +223,7 @@ func doWebCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse
 		url = "https://"
 	}
 
-	url+= flAddr+"/grpc.health.v1.Health/Check"
+	url += flAddr + "/grpc.health.v1.Health/Check"
 
 	var contentType = "application/grpc-web-text+proto"
 
@@ -237,7 +238,7 @@ func doWebCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse
 		return nil, 0, 0
 	}
 
-	headerBytes := append([]byte{0,0,0,0}, byte(len(requestMsgBytes)))
+	headerBytes := append([]byte{0, 0, 0, 0}, byte(len(requestMsgBytes)))
 	requestBytes := append(headerBytes, requestMsgBytes...)
 
 	requestString := base64.StdEncoding.EncodeToString(requestBytes)
@@ -262,6 +263,8 @@ func doWebCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse
 		return nil, 0, 0
 	}
 
+	var resType = res.Header.Get("Content-Type")
+
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		log.Printf("got invalid grpc web result. error=%v", err)
@@ -269,17 +272,28 @@ func doWebCall(retcode *int, ctx context.Context) (*healthpb.HealthCheckResponse
 		return nil, 0, 0
 	}
 
-	var bodyString = string(body)
-	m1 := regexp.MustCompile(`(=+).+`)
-	var result = m1.ReplaceAllString(bodyString, "$1")
+	var resultBytes = body
+	if resType == "application/grpc-web-text" {
+		var bodyString = string(body)
+		// remove trailer message
+		m1 := regexp.MustCompile(`(=+).+`)
+		var result = m1.ReplaceAllString(bodyString, "$1")
 
-	dedodedBytes, err := base64.StdEncoding.DecodeString(result)
-	if err != nil {
-		log.Printf("got invalid grpc web result. error=%v", err)
-		*retcode = StatusRPCFailure
-		return nil, 0, 0
+		dedodedBytes, err := base64.StdEncoding.DecodeString(result)
+		if err != nil {
+
+			log.Printf("got invalid grpc web result. error=%v", err)
+			*retcode = StatusRPCFailure
+			return nil, 0, 0
+		}
+		resultBytes = dedodedBytes
 	}
-	resultBytes := dedodedBytes[5:]
+
+	// first byte is header
+	// next 4 bytes give the length of the message
+	len := binary.BigEndian.Uint32(resultBytes[1:5])
+
+	resultBytes = resultBytes[5 : 5+len]
 
 	protomsg := &healthpb.HealthCheckResponse{}
 

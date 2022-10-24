@@ -1,7 +1,7 @@
 module github.com/grpc-ecosystem/grpc-health-probe
 
 require (
-	github.com/golang/protobuf v1.4.3 // indirect
+	github.com/golang/protobuf v1.4.3
 	golang.org/x/net v0.0.0-20201202161906-c7110b5ffcbb // indirect
 	golang.org/x/sys v0.0.0-20201204225414-ed752295db88 // indirect
 	golang.org/x/text v0.3.4 // indirect
